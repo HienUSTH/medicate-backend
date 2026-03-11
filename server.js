@@ -1,6 +1,7 @@
 // server.js – backend riêng cho barcode, không dùng DB
 
 require('dotenv').config();
+const fetch = global.fetch || require('node-fetch');
 const express = require('express');
 const cors = require('cors');
 
@@ -43,30 +44,39 @@ const COMBO_WORDS = ['combo', 'set', 'bộ', 'tặng', 'quà tặng', 'kèm', 'p
 
 const DOSAGE_RE   = /\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|g|kg|ml|mL|iu|IU)\b/gi;
 
-const STORE_WORDS = ['nhà thuốc', 'nhathuoc', 'long châu', 'an khang',
-  'pharmacity', 'medigo', 'tiki', 'shopee', 'lazada', 'central pharmacy'];
+const STORE_WORDS = [
+  'nhà thuốc', 'nhathuoc', 'long châu', 'long chau', 'an khang',
+  'pharmacity', 'medigo', 'tiki', 'shopee', 'lazada',
+  'central pharmacy', 'nơi bán', 'mua ở đâu', 'giá bao nhiêu',
+  'chính hãng', 'ưu đãi', 'khuyến mãi', 'giao nhanh'
+];
+
+const BAD_TAIL_RE = /\s*[-–—|]\s*(nơi bán|mua ở đâu|giá.*|chính hãng|ưu đãi.*|khuyến mãi.*|giao nhanh.*|đặt mua.*|mua ngay.*)$/i;
 
 // Làm sạch tiêu đề sản phẩm: giữ lại tên + hàm lượng + dạng, bỏ đuôi quảng cáo
 function cleanProductName(raw) {
   if (!raw) return '';
   let s = String(raw).trim();
 
-  // Bỏ phần sau dấu | nếu là tên cửa hàng
+  // Bỏ phần sau dấu | nếu là tên cửa hàng / đuôi bán hàng
   s = s.replace(/\s*\|\s*[^|]+$/i, (m) => {
     const tail = m.replace(/^\s*\|\s*/, '').toLowerCase();
     return STORE_WORDS.some(w => tail.includes(w)) ? '' : m;
   });
 
-  // Bỏ phần sau dấu - nếu là tên cửa hàng
-  s = s.replace(/\s*-\s*[^-]+$/i, (m) => {
-    const tail = m.replace(/^\s*-\s*/, '').toLowerCase();
+  // Bỏ phần sau dấu - nếu là tên cửa hàng / đuôi bán hàng
+  s = s.replace(/\s*[-–—]\s*[^-–—]+$/i, (m) => {
+    const tail = m.replace(/^\s*[-–—]\s*/, '').toLowerCase();
     return STORE_WORDS.some(w => tail.includes(w)) ? '' : m;
   });
 
-  // Bỏ SKU / Mã ở cuối
+  // Bỏ các đuôi kiểu "nơi bán", "mua ở đâu", "giá..."
+  s = s.replace(BAD_TAIL_RE, '');
+
+  // Bỏ SKU / mã
   s = s.replace(/\b(SKU|MÃ|Mã)\s*[:#]?\s*[\w-]+$/gi, '');
 
-  // Bỏ thông tin đóng gói kiểu "hộp 10 vỉ x 10 viên"...
+  // Bỏ thông tin đóng gói dài ở cuối
   s = s.replace(/\b(hộp|hop)\s+\d+.*$/i, '');
   s = s.replace(/\b(vỉ|vỉ)\s+\d+.*$/i, '');
   s = s.replace(/\b(gói|gói)\s+\d+.*$/i, '');
@@ -197,6 +207,65 @@ app.get('/', (req, res) => {
   res.json({ ok: true, service: 'medicate-barcode' });
 });
 
+async function googleSearchOnce(key, cx, query) {
+  const url =
+    `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(key)}` +
+    `&cx=${encodeURIComponent(cx)}` +
+    `&num=10&q=${encodeURIComponent(query)}`;
+
+  const r = await fetch(url);
+  const txt = await r.text();
+
+  if (!r.ok) {
+    throw new Error(`Google ${r.status}: ${txt.slice(0, 200)}`);
+  }
+
+  let data = {};
+  try {
+    data = JSON.parse(txt || '{}');
+  } catch (_) {
+    data = {};
+  }
+
+  const items = Array.isArray(data.items) ? data.items : [];
+  return items.map(it => ({
+    title: it.title || '',
+    link: it.link || '',
+    snippet: it.snippet || ''
+  }));
+}
+
+async function searchBarcodeCandidates(key, cx, code) {
+  const queries = [
+    `${code} thuốc`,
+    `${code}`,
+    `${code} site:nhathuoclongchau.com`,
+    `${code} site:nhathuocankhang.com`,
+    `${code} site:pharmacity.vn`,
+    `${code} site:medigoapp.com`
+  ];
+
+  const all = [];
+  const seen = new Set();
+
+  for (const q of queries) {
+    try {
+      const items = await googleSearchOnce(key, cx, q);
+      for (const it of items) {
+        const k = `${it.link}__${it.title}`.toLowerCase();
+        if (!seen.has(k)) {
+          seen.add(k);
+          all.push(it);
+        }
+      }
+    } catch (err) {
+      console.error('google search fail:', q, err.message);
+    }
+  }
+
+  return all;
+}
+
 // API chính: resolve barcode -> tên thuốc
 app.get('/api/barcode/resolve', async (req, res) => {
   try {
@@ -214,27 +283,14 @@ app.get('/api/barcode/resolve', async (req, res) => {
       return res.status(500).json({ error: 'Missing GOOGLE_API_KEY/GOOGLE_CSE_ID' });
     }
 
-    const q   = encodeURIComponent(`${code} thuốc`);
-    const url = `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&q=${q}`;
+    const mapped = await searchBarcodeCandidates(key, cx, code);
 
-    const r = await fetch(url);
-    if (!r.ok) {
-      return res.status(502).json({ error: 'Search API failed' });
-    }
-
-    const data  = await r.json();
-    const items = (data && data.items) ? data.items.slice(0, 10) : [];
-    if (!items.length) {
+    if (!mapped.length) {
       return res.status(404).json({ error: 'No search result for this code' });
     }
 
-    const mapped = items.map(it => ({
-      title:   it.title   || '',
-      link:    it.link    || '',
-      snippet: it.snippet || ''
-    }));
-
     const best = pickBest(mapped);
+
     if (!best) {
       return res.status(404).json({ error: 'Cannot infer product name' });
     }
